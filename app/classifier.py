@@ -357,7 +357,7 @@ class AIClassifier:
                 continue
             except MalformedResponseError as exc:
                 last_err = exc
-                self._cooldown(p, 120.0, "malformed response")
+                self._disable(p, str(exc)[:120])
                 continue
 
             if not content:

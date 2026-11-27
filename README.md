@@ -60,7 +60,6 @@ uv run anti-judol submit
 2. Di repo GitHub, buka **Settings → Secrets and variables → Actions**, tambahkan *Repository secrets*:
    - `DATABASE_URL`
    - Key LLM yang kamu punya (yang tidak diisi otomatis dilewati): `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `ZHIPU_API_KEY`, `NVIDIA_API_KEY`
-   - GitHub Models **tidak perlu secret**: workflow otomatis memakai `GITHUB_TOKEN` (`permissions: models: read`)
    - *(Opsional)* `LLM_PROVIDERS` (JSON provider custom) atau `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL` (DeepSeek panitia)
    - Cara cepat dari terminal: `gh secret set GROQ_API_KEY` (lalu tempel key-nya)
    - *(Opsional)* `URLSCAN_API_KEY`
