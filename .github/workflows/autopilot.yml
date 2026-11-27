@@ -47,5 +47,5 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           WORKER_ID: github-actions-${{ github.run_id }}
           VERIFY_BATCH_SIZE: "30"
-          VERIFY_CONCURRENCY: "10"
+          VERIFY_CONCURRENCY: "2"
         run: uv run anti-judol verify --loops ${{ github.event.inputs.verify_loops || '3' }}

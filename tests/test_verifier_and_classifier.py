@@ -1,6 +1,12 @@
 """Unit tests for HTML extraction, parked/dead detection, and AI JSON parsing."""
 
-from app.classifier import _parse_llm_json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+from openai import BadRequestError, RateLimitError
+
+from app.classifier import AIClassifier, _parse_llm_json
+from app.config import Settings
 from app.verifier import detect_parked_or_dead, extract_page_content
 
 
@@ -81,3 +87,60 @@ def test_parse_llm_json_clamps_and_sanitizes_invalid_category() -> None:
     res = _parse_llm_json(raw)
     assert res.category == "SAFE"
     assert res.confidence == 1.0
+
+
+async def test_classifier_retries_on_rate_limit_with_json_mode() -> None:
+    settings = Settings(llm_api_key="test-key", llm_base_url="https://example.com/v1", llm_model="test")
+    clf = AIClassifier(settings)
+
+    req = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    resp_429 = httpx.Response(429, request=req)
+    rate_err = RateLimitError("rate limited", response=resp_429, body=None)
+
+    ok_msg = MagicMock()
+    ok_msg.choices = [MagicMock(message=MagicMock(content='{"category":"JUDOL","confidence":0.9,"reason":"slot"}'))]
+
+    mock_create = AsyncMock(side_effect=[rate_err, ok_msg])
+    clf.client.chat.completions.create = mock_create  # type: ignore[method-assign]
+
+    with patch("app.classifier.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        res = await clf.classify(
+            url="https://slot.example",
+            http_status=200,
+            title="Slot",
+            meta_description="",
+            body_snippet="Slot gacor",
+        )
+
+    assert res.category == "JUDOL"
+    assert mock_create.await_count == 2
+    assert mock_sleep.await_count == 1
+    assert mock_create.call_args_list[1].kwargs["response_format"] == {"type": "json_object"}
+
+
+async def test_classifier_falls_back_without_json_mode_on_bad_request() -> None:
+    settings = Settings(llm_api_key="test-key", llm_base_url="https://example.com/v1", llm_model="test")
+    clf = AIClassifier(settings)
+
+    req = httpx.Request("POST", "https://example.com/v1/chat/completions")
+    resp_400 = httpx.Response(400, request=req)
+    bad_err = BadRequestError("json_object unsupported", response=resp_400, body=None)
+
+    ok_msg = MagicMock()
+    ok_msg.choices = [MagicMock(message=MagicMock(content='{"category":"SAFE","confidence":0.8,"reason":"ok"}'))]
+
+    mock_create = AsyncMock(side_effect=[bad_err, ok_msg])
+    clf.client.chat.completions.create = mock_create  # type: ignore[method-assign]
+
+    res = await clf.classify(
+        url="https://safe.example",
+        http_status=200,
+        title="Home",
+        meta_description="",
+        body_snippet="Company profile",
+    )
+
+    assert res.category == "SAFE"
+    assert mock_create.await_count == 2
+    assert "response_format" in mock_create.call_args_list[0].kwargs
+    assert "response_format" not in mock_create.call_args_list[1].kwargs

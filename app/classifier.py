@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    AsyncOpenAI,
+    BadRequestError,
+    RateLimitError,
+)
 
 from app.config import Settings
 
@@ -85,7 +93,43 @@ class AIClassifier:
         self.client = AsyncOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
+            max_retries=0,
         )
+
+    async def _create_completion(
+        self,
+        *,
+        user_prompt: str,
+        use_json_mode: bool,
+        max_attempts: int = 4,
+    ) -> Any:
+        """Call chat completions with exponential backoff on 429/5xx transient errors."""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.1,
+            "max_tokens": 220,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if use_json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        for attempt in range(max_attempts):
+            try:
+                return await self.client.chat.completions.create(**kwargs)
+            except (RateLimitError, APIConnectionError) as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                delay = (2.0 * (2**attempt)) + random.uniform(0.0, 1.0)
+                await asyncio.sleep(delay)
+            except APIStatusError as exc:
+                if exc.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                    delay = (2.0 * (2**attempt)) + random.uniform(0.0, 1.0)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
     async def classify(
         self,
@@ -106,26 +150,15 @@ class AIClassifier:
         )
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.1,
-                max_tokens=220,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
+            response = await self._create_completion(
+                user_prompt=user_prompt,
+                use_json_mode=True,
             )
-        except Exception:
-            # Fallback without response_format for OpenAI-compatible endpoints that reject it
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.1,
-                max_tokens=220,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
+        except BadRequestError:
+            # Fallback only when endpoint rejects response_format, never on 429/5xx
+            response = await self._create_completion(
+                user_prompt=user_prompt,
+                use_json_mode=False,
             )
 
         content = (response.choices[0].message.content or "").strip()
