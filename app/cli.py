@@ -27,6 +27,13 @@ app = typer.Typer(
 console = Console()
 
 
+@app.callback()
+def _setup_logging() -> None:
+    """Show router cooldown/disable messages without noisy third-party INFO logs."""
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    logging.getLogger("app").setLevel(logging.INFO)
+
+
 def _get_db() -> Database:
     settings = get_settings()
     return Database(settings.database_url)

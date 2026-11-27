@@ -43,6 +43,27 @@ jobs:
           WORKER_ID: github-actions-${{ github.run_id }}
         run: uv run anti-judol harvest
 
+      - name: Check LLM providers
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Multi-provider router: secret yang kosong otomatis dilewati
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GHMODELS_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          LLM_PROVIDERS: ${{ secrets.LLM_PROVIDERS }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          WORKER_ID: github-actions-${{ github.run_id }}
+          VERIFY_BATCH_SIZE: "30"
+          VERIFY_CONCURRENCY: "4"
+        run: uv run anti-judol llm-check || true
+
       - name: Verify & classify pending candidates
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
