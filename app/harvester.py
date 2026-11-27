@@ -93,7 +93,12 @@ async def harvest_urlscan(
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
         for kw in keywords:
-            query = f"domain:*{kw}* OR page.title:{kw}"
+            # Anonymous URLScan queries disallow leading wildcards (*kw*).
+            query = (
+                f"domain:*{kw}* OR page.title:{kw}"
+                if api_key
+                else f"domain:{kw}* OR page.title:{kw}"
+            )
             params = {"q": query, "size": size_per_keyword}
             try:
                 resp = await client.get("https://urlscan.io/api/v1/search/", params=params)
@@ -102,6 +107,11 @@ async def harvest_urlscan(
                     await asyncio.sleep(5.0)
                     continue
                 if resp.status_code != 200:
+                    logger.warning(
+                        "URLScan returned HTTP %s for keyword '%s'",
+                        resp.status_code,
+                        kw,
+                    )
                     continue
                 payload = resp.json()
                 for hit in payload.get("results", []):
