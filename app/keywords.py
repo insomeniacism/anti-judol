@@ -35,3 +35,49 @@ CERTSTREAM_PATTERN = re.compile(
     r"zeus\d+|mahjong|scatter|pinjol|danakaget|dana-kaget|caircepat)",
     re.IGNORECASE,
 )
+
+# ------------------------------------------------------------------------------
+# Keyword pre-filter (classifier.keyword_prefilter): putus kasus judol yang sangat
+# jelas tanpa memanggil LLM, supaya kuota free-tier dipakai untuk kasus ambigu saja.
+# ------------------------------------------------------------------------------
+JUDOL_STRONG_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p)
+    for p in (
+        r"slot\s*gacor",
+        r"\bgacor\b",
+        r"max\s*win",
+        r"\btogel\b",
+        r"\btoto\s*\d*\b",
+        r"\brtp\b",
+        r"\bscatter\b",
+        r"bonus\s*new\s*member",
+        r"deposit\s*(?:pulsa|dana|ovo|gopay|qris|via)",
+        r"slot\s*(?:online|terpercaya|resmi|88|777|deposit)",
+        r"situs\s*(?:slot|judi|togel)",
+        r"judi\s*(?:online|bola|slot)",
+        r"link\s*alternatif",
+        r"\bbandar\b",
+        r"\bsbobet\b",
+        r"sabung\s*ayam",
+        r"casino\s*online",
+        r"live\s*casino",
+        r"pragmatic\s*play",
+        r"mahjong\s*ways",
+        r"\bzeus\b",
+        r"olympus",
+        r"\bagen\s*(?:slot|judi|togel|bola)",
+        r"\bwd\b",
+        r"\bjackpot\b",
+    )
+]
+
+JUDOL_ACTION_PATTERN = re.compile(
+    r"\b(?:daftar|login|masuk|deposit|withdraw|bonus|promo|klaim|main\s*sekarang)\b"
+)
+
+# Konteks berita / edukasi / penegakan hukum -> jangan diputus otomatis, serahkan ke LLM
+JUDOL_NEGATIVE_PATTERN = re.compile(
+    r"\b(?:berita|pemberantasan|berantas|komdigi|kominfo|polri|polisi|polda|polres|"
+    r"ditangkap|tersangka|diblokir|bahaya\s*judi|kecanduan|waspada|imbauan|"
+    r"satgas|ojk|kompas|detik|tribun|liputan6|cnn|kumparan|wikipedia)\b"
+)

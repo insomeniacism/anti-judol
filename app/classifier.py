@@ -1,23 +1,33 @@
-"""Modular OpenAI-compatible AI classifier for Indonesian illegal websites."""
+"""Multi-provider OpenAI-compatible AI classifier for Indonesian illegal websites.
+
+Konsep mirip 9router: beberapa provider free-tier digilir (round-robin), provider
+yang kena 429 / error diistirahatkan (cooldown) dan request langsung pindah ke
+provider berikutnya, sehingga kuota gratis gabungan bisa bertahan jauh lebih lama.
+Kasus judol yang sangat jelas diputus oleh keyword pre-filter tanpa memanggil LLM.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import random
+import logging
+import math
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from openai import (
     APIConnectionError,
     APIStatusError,
+    APITimeoutError,
     AsyncOpenAI,
-    BadRequestError,
-    RateLimitError,
 )
 
 from app.config import Settings
+from app.keywords import JUDOL_ACTION_PATTERN, JUDOL_NEGATIVE_PATTERN, JUDOL_STRONG_PATTERNS
+
+logger = logging.getLogger(__name__)
 
 Category = Literal["JUDOL", "PINJOL_ILEGAL", "SCAM_PHISHING", "SAFE"]
 VALID_CATEGORIES: set[str] = {"JUDOL", "PINJOL_ILEGAL", "SCAM_PHISHING", "SAFE"}
@@ -40,6 +50,19 @@ Respond ONLY with a valid JSON object using this exact schema:
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# Preset provider free-tier. Key & model dibaca dari Settings (lihat config.py / .env.example).
+# rpm = batas request/menit yang dijaga proaktif supaya tidak sering kena 429.
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "rpm": 28},
+    "cerebras": {"base_url": "https://api.cerebras.ai/v1", "rpm": 25},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "rpm": 10},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "rpm": 18},
+    "ghmodels": {"base_url": "https://models.github.ai/inference", "rpm": 10},
+    "mistral": {"base_url": "https://api.mistral.ai/v1", "rpm": 50},
+    "zhipu": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "rpm": 30},
+    "nvidia": {"base_url": "https://integrate.api.nvidia.com/v1", "rpm": 35},
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ClassificationResult:
@@ -48,11 +71,58 @@ class ClassificationResult:
     category: Category
     confidence: float
     reason: str
+    provider: str = ""
+
+
+class MalformedResponseError(RuntimeError):
+    """Provider returned something that is not a chat completion (HTML, plain text, ...)."""
+
+
+def _extract_content(resp: Any) -> str:
+    try:
+        return (resp.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise MalformedResponseError(
+            f"Respons bukan chat completion: {str(resp)[:80]!r}"
+        ) from exc
+
+
+class AllProvidersExhaustedError(RuntimeError):
+    """Raised when every configured LLM provider is cooling down or disabled."""
+
+
+@dataclass(slots=True)
+class Provider:
+    """One OpenAI-compatible endpoint plus its runtime routing state."""
+
+    name: str
+    base_url: str
+    api_key: str
+    model: str
+    rpm: float | None = None
+    client: AsyncOpenAI = field(init=False, repr=False)
+    available_at: float = 0.0
+    json_mode: bool = True
+    disabled_reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            max_retries=0,
+            timeout=40.0,
+        )
+
+    @property
+    def disabled(self) -> bool:
+        return bool(self.disabled_reason)
 
 
 def _parse_llm_json(raw_text: str) -> ClassificationResult:
     """Parse LLM JSON response with fallback extraction for non-strict models."""
     text = raw_text.strip()
+    # Reasoning models sometimes emit <think>...</think> before the JSON
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     match = _JSON_BLOCK_RE.search(text)
     if not match:
         return ClassificationResult(
@@ -83,53 +153,236 @@ def _parse_llm_json(raw_text: str) -> ClassificationResult:
     return ClassificationResult(category=category, confidence=conf, reason=reason)
 
 
-class AIClassifier:
-    """OpenAI-compatible async classifier (supports Groq, Gemini, DeepSeek, etc.)."""
+def keyword_prefilter(title: str, meta_description: str, body_snippet: str) -> ClassificationResult | None:
+    """Return a JUDOL verdict for blatant gambling pages without spending an LLM call.
 
-    def __init__(self, settings: Settings) -> None:
-        if not settings.llm_api_key:
-            raise ValueError("LLM_API_KEY is not configured. Set it in .env or environment.")
-        self.model = settings.llm_model
-        self.client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            max_retries=0,
+    Conservative on purpose: needs >=3 distinct strong gambling terms, at least one
+    call-to-action (daftar/deposit/login/bonus), and no news/anti-judol context words.
+    Everything else goes to the LLM.
+    """
+    text = f"{title}\n{meta_description}\n{body_snippet}".lower()
+    hits: list[str] = []
+    for pattern in JUDOL_STRONG_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            hits.append(" ".join(m.group(0).split()))
+    if len(hits) < 3:
+        return None
+    if not JUDOL_ACTION_PATTERN.search(text):
+        return None
+    if JUDOL_NEGATIVE_PATTERN.search(text):
+        return None
+    confidence = min(0.99, 0.80 + 0.04 * len(hits))
+    shown = ", ".join(hits[:5])
+    return ClassificationResult(
+        category="JUDOL",
+        confidence=confidence,
+        reason=f"Keyword pre-filter: {len(hits)} sinyal judol kuat ({shown})",
+        provider="prefilter",
+    )
+
+
+def build_providers(settings: Settings) -> list[Provider]:
+    """Build the provider pool from LLM_PROVIDERS JSON, preset keys, and legacy LLM_* vars."""
+    providers: list[Provider] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def _add(name: str, base_url: str, api_key: str, model: str, rpm: float | None) -> None:
+        if not api_key or not model or not base_url:
+            return
+        key = (base_url.rstrip("/"), api_key, model)
+        if key in seen:
+            return
+        seen.add(key)
+        providers.append(Provider(name=name, base_url=base_url, api_key=api_key, model=model, rpm=rpm))
+
+    # 1. Custom JSON list (most flexible: Cloudflare, SiliconFlow, local Ollama, 9router, dll.)
+    if settings.llm_providers.strip():
+        try:
+            items = json.loads(settings.llm_providers)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"LLM_PROVIDERS bukan JSON valid: {exc}") from exc
+        if not isinstance(items, list):
+            raise ValueError("LLM_PROVIDERS harus berupa JSON array")
+        for i, item in enumerate(items):
+            _add(
+                str(item.get("name") or f"custom{i}"),
+                str(item.get("base_url", "")),
+                str(item.get("api_key", "")),
+                str(item.get("model", "")),
+                float(item["rpm"]) if item.get("rpm") else None,
+            )
+
+    # 2. Presets: cukup isi <NAMA>_API_KEY di .env / GitHub Secrets
+    for name, preset in PROVIDER_PRESETS.items():
+        _add(
+            name,
+            preset["base_url"],
+            getattr(settings, f"{name}_api_key"),
+            getattr(settings, f"{name}_model"),
+            preset["rpm"],
         )
 
-    async def _create_completion(
-        self,
-        *,
-        user_prompt: str,
-        use_json_mode: bool,
-        max_attempts: int = 4,
-    ) -> Any:
-        """Call chat completions with exponential backoff on 429/5xx transient errors."""
+    # 3. Legacy single-provider config (tetap didukung, mis. DeepSeek panitia)
+    _add("default", settings.llm_base_url, settings.llm_api_key, settings.llm_model, None)
+
+    return providers
+
+
+def _retry_after_seconds(exc: APIStatusError) -> float | None:
+    try:
+        raw = exc.response.headers.get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+class AIClassifier:
+    """Round-robin router over multiple free-tier OpenAI-compatible providers."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.providers = build_providers(settings)
+        if not self.providers:
+            raise ValueError(
+                "Tidak ada LLM provider yang dikonfigurasi. Isi minimal satu dari: "
+                "GROQ_API_KEY, CEREBRAS_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, "
+                "GHMODELS_API_KEY, MISTRAL_API_KEY, ZHIPU_API_KEY, NVIDIA_API_KEY, "
+                "LLM_PROVIDERS, atau LLM_API_KEY."
+            )
+        self.prefilter_enabled = settings.keyword_prefilter
+        self.default_cooldown = settings.llm_cooldown_seconds
+        self.max_wait = settings.llm_max_wait_seconds
+        self._rr = 0
+
+    # Backward-compat convenience for single-provider callers/tests
+    @property
+    def client(self) -> AsyncOpenAI:
+        return self.providers[0].client
+
+    @property
+    def model(self) -> str:
+        return self.providers[0].model
+
+    def _pick(self) -> tuple[Provider | None, float]:
+        """Return the next ready provider (round-robin) or the soonest wait time."""
+        now = time.monotonic()
+        active = [p for p in self.providers if not p.disabled]
+        if not active:
+            return None, math.inf
+        n = len(self.providers)
+        for offset in range(n):
+            p = self.providers[(self._rr + offset) % n]
+            if not p.disabled and p.available_at <= now:
+                self._rr = (self._rr + offset + 1) % n
+                return p, 0.0
+        soonest = min(active, key=lambda p: p.available_at)
+        return soonest, soonest.available_at - now
+
+    def _cooldown(self, p: Provider, seconds: float, why: str) -> None:
+        seconds = max(1.0, min(seconds, 6 * 3600.0))
+        p.available_at = max(p.available_at, time.monotonic() + seconds)
+        logger.info("LLM provider %s cooldown %.0fs (%s)", p.name, seconds, why)
+
+    def _disable(self, p: Provider, why: str) -> None:
+        p.disabled_reason = why
+        logger.warning("LLM provider %s dinonaktifkan untuk run ini: %s", p.name, why)
+
+    async def _call(self, p: Provider, user_prompt: str) -> str:
+        """Single request to one provider; falls back to non-JSON mode once on HTTP 400."""
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": p.model,
             "temperature": 0.1,
-            "max_tokens": 220,
+            "max_tokens": 300,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
         }
-        if use_json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-
-        for attempt in range(max_attempts):
+        if p.json_mode:
             try:
-                return await self.client.chat.completions.create(**kwargs)
-            except (RateLimitError, APIConnectionError) as exc:
-                if attempt == max_attempts - 1:
-                    raise
-                delay = (2.0 * (2**attempt)) + random.uniform(0.0, 1.0)
-                await asyncio.sleep(delay)
+                resp = await p.client.chat.completions.create(
+                    **kwargs, response_format={"type": "json_object"}
+                )
+                return _extract_content(resp)
             except APIStatusError as exc:
-                if exc.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
-                    delay = (2.0 * (2**attempt)) + random.uniform(0.0, 1.0)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                if exc.status_code != 400:
+                    raise
+                # Endpoint menolak response_format -> ingat & ulang tanpa JSON mode
+                p.json_mode = False
+        resp = await p.client.chat.completions.create(**kwargs)
+        return _extract_content(resp)
+
+    async def _route(self, user_prompt: str) -> tuple[str, str]:
+        """Try providers until one answers. Returns (content, provider_name)."""
+        max_attempts = len(self.providers) * 2 + 2
+        last_err: Exception | None = None
+
+        for _ in range(max_attempts):
+            p, wait = self._pick()
+            if p is None:
+                break
+            if wait > 0:
+                if wait > self.max_wait:
+                    break
+                await asyncio.sleep(wait)
+
+            if p.rpm:
+                # Reservasi slot berikutnya sebelum await, supaya task paralel tidak menabrak limit
+                p.available_at = max(p.available_at, time.monotonic()) + 60.0 / p.rpm
+
+            try:
+                content = await self._call(p, user_prompt)
+            except APIStatusError as exc:
+                last_err = exc
+                code = exc.status_code
+                if code == 429:
+                    self._cooldown(p, _retry_after_seconds(exc) or self.default_cooldown, "429 rate limit")
+                elif code in (401, 403):
+                    self._disable(p, f"HTTP {code} (API key salah / tidak punya akses)")
+                elif code == 404:
+                    self._disable(p, f"HTTP 404 (model '{p.model}' tidak ditemukan)")
+                elif code == 402:
+                    self._disable(p, "HTTP 402 (kuota/kredit habis)")
+                else:
+                    self._cooldown(p, 15.0, f"HTTP {code}")
+                continue
+            except (APIConnectionError, APITimeoutError) as exc:
+                last_err = exc
+                self._cooldown(p, 15.0, type(exc).__name__)
+                continue
+            except MalformedResponseError as exc:
+                last_err = exc
+                self._cooldown(p, 120.0, "malformed response")
+                continue
+
+            if not content:
+                self._cooldown(p, 5.0, "empty response")
+                continue
+            return content, p.name
+
+        status = ", ".join(
+            f"{p.name}:{'off' if p.disabled else 'cooldown'}" for p in self.providers
+        )
+        raise AllProvidersExhaustedError(
+            f"Semua LLM provider sedang limit/nonaktif [{status}]; last error: {last_err}"
+        )
+
+    @staticmethod
+    def build_prompt(
+        *, url: str, http_status: int, title: str, meta_description: str, body_snippet: str
+    ) -> str:
+        return (
+            f"URL: {url}\n"
+            f"HTTP Status: {http_status}\n"
+            f"Title: {title or '(empty)'}\n"
+            f"Meta Description: {meta_description or '(empty)'}\n"
+            f"Body Snippet:\n{body_snippet or '(empty)'}"
+        )
 
     async def classify(
         self,
@@ -141,25 +394,58 @@ class AIClassifier:
         body_snippet: str,
     ) -> ClassificationResult:
         """Classify a single live website snapshot."""
-        user_prompt = (
-            f"URL: {url}\n"
-            f"HTTP Status: {http_status}\n"
-            f"Title: {title or '(empty)'}\n"
-            f"Meta Description: {meta_description or '(empty)'}\n"
-            f"Body Snippet:\n{body_snippet or '(empty)'}"
+        if self.prefilter_enabled:
+            quick = keyword_prefilter(title, meta_description, body_snippet)
+            if quick is not None:
+                return quick
+
+        user_prompt = self.build_prompt(
+            url=url,
+            http_status=http_status,
+            title=title,
+            meta_description=meta_description,
+            body_snippet=body_snippet,
+        )
+        content, provider_name = await self._route(user_prompt)
+        res = _parse_llm_json(content)
+        return ClassificationResult(
+            category=res.category,
+            confidence=res.confidence,
+            reason=res.reason,
+            provider=provider_name,
         )
 
+    async def probe(self, p: Provider) -> tuple[bool, str, float]:
+        """Send one test classification directly to a provider (used by `llm-check`)."""
+        prompt = self.build_prompt(
+            url="https://contoh-slot88.example",
+            http_status=200,
+            title="SLOT88 Situs Slot Gacor Maxwin Hari Ini",
+            meta_description="Daftar slot online, deposit pulsa, bonus new member 100%",
+            body_snippet="Login / Daftar. RTP live tertinggi. Link alternatif resmi.",
+        )
+        start = time.monotonic()
         try:
-            response = await self._create_completion(
-                user_prompt=user_prompt,
-                use_json_mode=True,
-            )
-        except BadRequestError:
-            # Fallback only when endpoint rejects response_format, never on 429/5xx
-            response = await self._create_completion(
-                user_prompt=user_prompt,
-                use_json_mode=False,
-            )
+            content = await self._call(p, prompt)
+        except APIStatusError as exc:
+            detail = f"HTTP {exc.status_code}: {str(exc.message)[:160]}"
+            if exc.status_code == 404:
+                detail += await self._suggest_models(p)
+            return False, detail, time.monotonic() - start
+        except Exception as exc:  # noqa: BLE001 - diagnostic command
+            return False, f"{type(exc).__name__}: {str(exc)[:160]}", time.monotonic() - start
+        res = _parse_llm_json(content)
+        info = f"{res.category} ({res.confidence:.2f}) json_mode={'on' if p.json_mode else 'off'}"
+        parsed = not res.reason.startswith(("Unparseable", "Invalid JSON"))
+        if parsed and res.category != "JUDOL":
+            info += " [peringatan: contoh judol tidak terdeteksi, model mungkin terlalu lemah]"
+        return parsed, info, time.monotonic() - start
 
-        content = (response.choices[0].message.content or "").strip()
-        return _parse_llm_json(content)
+    @staticmethod
+    async def _suggest_models(p: Provider) -> str:
+        try:
+            models = await p.client.models.list()
+            ids = [m.id for m in models.data][:15]
+        except Exception:
+            return ""
+        return f"\n    model tersedia: {', '.join(ids)}" if ids else ""

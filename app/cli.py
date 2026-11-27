@@ -16,6 +16,7 @@ from app.harvester import harvest_once, run_certstream
 from app.isp_checker import check_isp_accessibility
 from app.submitter import run_submitter
 from app.url_utils import InvalidURLError, domain_to_url, validate_and_normalize
+from app.classifier import AIClassifier
 from app.verifier import verify_batch
 
 app = typer.Typer(
@@ -73,15 +74,63 @@ def verify(
     settings = get_settings()
     db = Database(settings.database_url)
 
+    classifier = AIClassifier(settings)
+    console.print(
+        "[cyan]LLM providers:[/cyan] "
+        + ", ".join(f"{p.name}({p.model})" for p in classifier.providers)
+    )
+
     async def _run() -> None:
         for i in range(1, loops + 1):
-            res = await verify_batch(db, settings, batch_size=batch_size)
+            res = await verify_batch(db, settings, batch_size=batch_size, classifier=classifier)
             console.print(f"[cyan]Batch {i}/{loops}:[/cyan] {res}")
             if res.get("claimed", 0) == 0:
                 console.print("[yellow]Antrean PENDING kosong.[/yellow]")
                 break
+            if all(p.disabled for p in classifier.providers):
+                console.print("[red]Semua LLM provider nonaktif (key/model salah). Jalankan `anti-judol llm-check`.[/red]")
+                break
 
     asyncio.run(_run())
+
+
+@app.command("llm-check")
+def llm_check() -> None:
+    """Test every configured LLM provider (key, model, JSON mode, latency)."""
+    settings = get_settings()
+    try:
+        classifier = AIClassifier(settings)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    async def _run() -> list[tuple[str, str, bool, str, float]]:
+        results = await asyncio.gather(*(classifier.probe(p) for p in classifier.providers))
+        return [
+            (p.name, p.model, ok, info, secs)
+            for p, (ok, info, secs) in zip(classifier.providers, results)
+        ]
+
+    table = Table(title="LLM Provider Check")
+    table.add_column("Provider", style="bold")
+    table.add_column("Model")
+    table.add_column("Status")
+    table.add_column("Detail")
+    table.add_column("Latency", justify="right")
+    rows = asyncio.run(_run())
+    for name, model, ok, info, secs in rows:
+        table.add_row(
+            name,
+            model,
+            "[green]OK[/green]" if ok else "[red]GAGAL[/red]",
+            info,
+            f"{secs:.1f}s",
+        )
+    console.print(table)
+    ok_count = sum(1 for r in rows if r[2])
+    console.print(f"[bold]{ok_count}/{len(rows)} provider siap dipakai.[/bold]")
+    if ok_count == 0:
+        raise typer.Exit(code=1)
 
 
 @app.command("check-isp")

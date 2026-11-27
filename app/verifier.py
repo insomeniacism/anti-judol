@@ -243,15 +243,18 @@ async def _process_one(
             is_parked=False,
             category=ai_res.category,
             confidence=ai_res.confidence,
-            ai_reason=ai_res.reason,
+            ai_reason=f"[{ai_res.provider}] {ai_res.reason}" if ai_res.provider else ai_res.reason,
         )
         counts[final_status] = counts.get(final_status, 0) + 1
+        via = f"via:{ai_res.provider or 'unknown'}"
+        counts[via] = counts.get(via, 0) + 1
 
 
 async def verify_batch(
     db: Database,
     settings: Settings,
     batch_size: int | None = None,
+    classifier: AIClassifier | None = None,
 ) -> dict[str, int]:
     """Claim a batch of PENDING candidates and verify them concurrently."""
     size = batch_size or settings.verify_batch_size
@@ -263,7 +266,8 @@ async def verify_batch(
     if not claimed:
         return {"claimed": 0}
 
-    classifier = AIClassifier(settings)
+    # Reuse one classifier across batches so provider cooldown state persists
+    classifier = classifier or AIClassifier(settings)
     semaphore = asyncio.Semaphore(settings.verify_concurrency)
     counts: dict[str, int] = {"claimed": len(claimed)}
 
