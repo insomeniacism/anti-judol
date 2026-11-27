@@ -1,0 +1,51 @@
+name: Anti-Judol Autopilot (Harvest & Verify)
+
+on:
+  schedule:
+    # Runs every 2 hours (12x/day, ~2 min/run -> safe within GitHub Actions free tier)
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      verify_loops:
+        description: "Number of verification batches to run"
+        required: false
+        default: "3"
+
+concurrency:
+  group: anti-judol-autopilot
+  cancel-in-progress: false
+
+jobs:
+  harvest-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python & install dependencies
+        run: uv sync --no-dev
+
+      - name: Harvest fresh OSINT candidates
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          URLSCAN_API_KEY: ${{ secrets.URLSCAN_API_KEY }}
+          WORKER_ID: github-actions-${{ github.run_id }}
+        run: uv run anti-judol harvest
+
+      - name: Verify & classify pending candidates
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          WORKER_ID: github-actions-${{ github.run_id }}
+          VERIFY_BATCH_SIZE: "30"
+          VERIFY_CONCURRENCY: "10"
+        run: uv run anti-judol verify --loops ${{ github.event.inputs.verify_loops || '3' }}
